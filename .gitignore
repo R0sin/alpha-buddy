@@ -1,0 +1,21 @@
+.pio/
+.vscode/
+*.log
+*.pcap
+*.pcapng
+secrets.ini
+
+# Local compiler and Python artifacts
+*.obj
+*.o
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local release output (attach verified packages to a release separately)
+/dist/
+
+# Local design, development, research notes and historical experiments
+/docs/
+/archive/
+
