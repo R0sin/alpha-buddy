@@ -80,5 +80,5 @@ pio run -e m5stack-sticks3 --target upload --upload-port COM9
 
 [MIT License](LICENSE) · Copyright (c) 2026 R0sin
 
-感谢 Alpha-Fairy、JPEGDEC、M5Unified 和 M5GFX，详见[第三方声明](THIRD_PARTY_NOTICES.md)。
+相机通信参考了 [Alpha-Fairy](https://github.com/frank26080115/alpha-fairy)，感谢该项目及 JPEGDEC、M5Unified 和 M5GFX，详见[第三方声明](THIRD_PARTY_NOTICES.md)。
 本项目是社区项目，不代表 Sony 或 M5Stack 官方固件。
