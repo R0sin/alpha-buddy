@@ -8,20 +8,20 @@ class DisconnectedShutdown {
 public:
     static constexpr uint32_t kTimeoutMs = 5U * 60U * 1000U;
 
-    bool update(uint32_t now, bool connected, bool externalPower, bool activity) {
-        if (connected || externalPower) {
-            _waiting = false;
-            return false;
-        }
-        if (!_waiting || activity) {
-            _waiting = true;
+    void setClientCount(uint32_t now, uint8_t count) {
+        const bool connected = count != 0;
+        if (_connected && !connected) {
             _waitingSinceMs = now;
         }
-        return now - _waitingSinceMs >= kTimeoutMs;
+        _connected = connected;
+    }
+
+    bool shouldShutdown(uint32_t now) const {
+        return !_connected && now - _waitingSinceMs >= kTimeoutMs;
     }
 
 private:
-    bool _waiting = false;
+    bool _connected = false;
     uint32_t _waitingSinceMs = 0;
 };
 

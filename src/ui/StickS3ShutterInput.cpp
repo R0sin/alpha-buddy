@@ -56,9 +56,6 @@ public:
             _events.store(1);
             _held.store(true);
         }
-        if (_stableButtons != 0) {
-            _activityPending.store(true);
-        }
         _running.store(true);
         if (xTaskCreatePinnedToCore(taskEntry,
                                     "alpha-button",
@@ -113,7 +110,6 @@ public:
         portEXIT_CRITICAL(&_gestureLock);
     }
 
-    bool takeActivity() { return _activityPending.exchange(false); }
     bool takeGridToggle() { return (_gridClicks.exchange(0) & 1U) != 0; }
 
 private:
@@ -148,9 +144,6 @@ private:
                     _cancelPending.store(false);
                     portEXIT_CRITICAL(&_gestureLock);
                 }
-                if (pressed != 0) {
-                    _activityPending.store(true);
-                }
             }
             if (_sideClick.update((_stableButtons & 2U) != 0, now)) {
                 _gridClicks.fetch_add(1);
@@ -168,8 +161,6 @@ private:
     FlipCancelGesture _gesture;
     bool _orientationResolved = false;
     LandscapeOrientation _screenOrientation = LandscapeOrientation::Rotation1;
-    // Separate from shutter events: the power timer must not consume AF/capture input.
-    std::atomic<bool> _activityPending{false};
     SideButtonDoubleClick _sideClick;
     std::atomic<unsigned> _gridClicks{0};
     uint8_t _stableButtons = 0;
@@ -207,9 +198,6 @@ ShutterInputEvents StickS3ShutterInput::poll() {
     return _impl == nullptr ? ShutterInputEvents{} : _impl->takeEvents();
 }
 
-bool StickS3ShutterInput::takeActivity() {
-    return _impl != nullptr && _impl->takeActivity();
-}
 
 bool StickS3ShutterInput::takeGridToggle() {
     return _impl != nullptr && _impl->takeGridToggle();

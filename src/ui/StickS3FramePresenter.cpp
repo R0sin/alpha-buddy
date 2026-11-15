@@ -37,7 +37,6 @@ constexpr BaseType_t kDisplayTaskCore = 1;
 constexpr uint32_t kUiPollIntervalMs = 40;
 constexpr uint32_t kBatteryPollIntervalMs = 5000;
 constexpr uint32_t kPowerPollIntervalMs = 250;
-constexpr int16_t kUsbPresentMillivolts = 4000;
 constexpr int32_t kStatusWidth = 36;
 constexpr int32_t kStatusSlotHeight = 27;
 constexpr int32_t kStatusSlotCount = 5;
@@ -141,13 +140,17 @@ public:
         _feedback.store(feedback);
     }
 
-    void setWaitingForWifi(bool waiting) {
-        _waitingForWifi.store(waiting);
+    void setWifiClientCount(uint8_t count) {
+        // Wi-Fi callbacks and the display task share the shutdown timer.
+        portENTER_CRITICAL(&_powerLock);
+        _shutdown.setClientCount(millis(), count);
+        portEXIT_CRITICAL(&_powerLock);
+        _waitingForWifi.store(count == 0);
     }
 
     void setConnection(CameraConnection connection) {
         if (connection == CameraConnection::Connected) {
-            // Waiting-time button presses extend power-on time, not a future shot.
+            // Discard waiting-time shutter events before starting a camera session.
             _shutterInput.poll();
             _resumedAtMs.store(millis());
         } else {
@@ -155,12 +158,7 @@ public:
             ++_session;
             _cameraModes.store(0);
         }
-        const CameraConnection previous = _connection.exchange(connection);
-        if (connection == CameraConnection::Connected ||
-            previous == CameraConnection::Connected) {
-            // Preserve even a brief successful session between power polls.
-            _powerTimerReset.store(true);
-        }
+        _connection.store(connection);
     }
 
     void setPreviewPaused(bool paused) {
@@ -341,14 +339,10 @@ private:
         }
         _powerReadAttempted = true;
         _lastPowerReadMs = now;
-        const int16_t vbusMv = M5.Power.getVBUSVoltage();
-        const bool externalPower = vbusMv < 0 || vbusMv >= kUsbPresentMillivolts;
-        const bool buttonActivity = _shutterInput.takeActivity();
-        const bool sessionChanged = _powerTimerReset.exchange(false);
-        if (_shutdown.update(now,
-                             _connection.load() == CameraConnection::Connected,
-                             externalPower,
-                             buttonActivity || sessionChanged)) {
+        portENTER_CRITICAL(&_powerLock);
+        const bool shutdown = _shutdown.shouldShutdown(millis());
+        portEXIT_CRITICAL(&_powerLock);
+        if (shutdown) {
             Serial.println("{\"event\":\"auto_power_off\",\"reason\":\"disconnected_timeout\"}");
             // Runs on the display owner task, including during blocking handshakes.
             M5.Power.powerOff();
@@ -767,7 +761,7 @@ private:
     bool _cancelPending = false;
     uint16_t _drawnBorderColor = TFT_BLACK;
     DisconnectedShutdown _shutdown;
-    std::atomic<bool> _powerTimerReset{false};
+    portMUX_TYPE _powerLock = portMUX_INITIALIZER_UNLOCKED;
     uint32_t _lastPowerReadMs = 0;
     bool _powerReadAttempted = false;
     QueueHandle_t _freeSlots = nullptr;
@@ -853,8 +847,8 @@ void StickS3FramePresenter::setConnection(CameraConnection connection) {
     if (_impl != nullptr) _impl->setConnection(connection);
 }
 
-void StickS3FramePresenter::setWaitingForWifi(bool waiting) {
-    if (_impl != nullptr) _impl->setWaitingForWifi(waiting);
+void StickS3FramePresenter::setWifiClientCount(uint8_t count) {
+    if (_impl != nullptr) _impl->setWifiClientCount(count);
 }
 
 void StickS3FramePresenter::setPreviewPaused(bool paused) {

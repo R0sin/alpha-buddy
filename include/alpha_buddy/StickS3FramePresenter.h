@@ -30,7 +30,7 @@ public:
                  uint16_t height) override;
     void setCaptureFeedback(CaptureFeedback feedback) override;
     void setConnection(CameraConnection connection) override;
-    void setWaitingForWifi(bool waiting);
+    void setWifiClientCount(uint8_t count);
     void setPreviewPaused(bool paused) override;
     void setCameraModes(CameraModes modes) override;
     FramePresentationStats end();

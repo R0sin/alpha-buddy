@@ -18,7 +18,6 @@ public:
     bool begin();
     void end();
     ShutterInputEvents poll() override;
-    bool takeActivity();
     bool takeGridToggle();
     bool held() const;
     bool cancelPending() const;

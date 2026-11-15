@@ -117,36 +117,35 @@ void test_side_button_double_click_timing_holds_and_wrap() {
 
 void test_disconnected_shutdown_deadline_resets_and_clock_wrap() {
     DisconnectedShutdown timer;
-    TEST_ASSERT_FALSE(timer.update(0, false, false, false));
-    // Failed handshakes/retries do not extend the original deadline.
-    TEST_ASSERT_FALSE(timer.update(5000, false, false, false));
-    TEST_ASSERT_FALSE(timer.update(299999, false, false, false));
-    TEST_ASSERT_TRUE(timer.update(300000, false, false, false));
+    TEST_ASSERT_FALSE(timer.shouldShutdown(0));
+    timer.setClientCount(5000, 0); // AP start/failure does not extend the deadline.
+    TEST_ASSERT_FALSE(timer.shouldShutdown(299999));
+    TEST_ASSERT_TRUE(timer.shouldShutdown(300000));
 
-    // Input at the deadline wins; its new timeout is a full five minutes.
-    TEST_ASSERT_FALSE(timer.update(300000, false, false, true));
-    TEST_ASSERT_FALSE(timer.update(599999, false, false, false));
-    TEST_ASSERT_TRUE(timer.update(600000, false, false, false));
+    // Any associated client inhibits shutdown, even without a PTP session.
+    timer.setClientCount(300000, 1);
+    TEST_ASSERT_FALSE(timer.shouldShutdown(1200000));
+    timer.setClientCount(1200000, 2);
+    timer.setClientCount(1200001, 1);
+    TEST_ASSERT_FALSE(timer.shouldShutdown(1800000));
+    timer.setClientCount(1800000, 0);
+    TEST_ASSERT_FALSE(timer.shouldShutdown(2099999));
+    TEST_ASSERT_TRUE(timer.shouldShutdown(2100000));
 
-    // An established session stays alive without requiring frames or input.
-    TEST_ASSERT_FALSE(timer.update(600000, true, false, false));
-    TEST_ASSERT_FALSE(timer.update(1200000, true, false, false));
-    TEST_ASSERT_FALSE(timer.update(1200001, false, false, false));
-    TEST_ASSERT_FALSE(timer.update(1500000, false, false, false));
-    TEST_ASSERT_TRUE(timer.update(1500001, false, false, false));
+    // Preserve a connect/disconnect pair between two display task polls.
+    timer.setClientCount(2100000, 1);
+    timer.setClientCount(2100001, 0);
+    timer.setClientCount(2200000, 0); // Repeated zero must not reset the timer.
+    TEST_ASSERT_FALSE(timer.shouldShutdown(2400000));
+    TEST_ASSERT_TRUE(timer.shouldShutdown(2400001));
 
-    // USB insertion at the deadline inhibits shutdown; unplug starts fresh.
-    TEST_ASSERT_FALSE(timer.update(1500001, false, true, false));
-    TEST_ASSERT_FALSE(timer.update(2400000, false, true, false));
-    TEST_ASSERT_FALSE(timer.update(2400001, false, false, false));
-    TEST_ASSERT_FALSE(timer.update(2700000, false, false, false));
-    TEST_ASSERT_TRUE(timer.update(2700001, false, false, false));
-
+    // USB and button activity are deliberately not inputs to the timer.
     timer = DisconnectedShutdown{};
     constexpr uint32_t start = UINT32_MAX - 1000U;
-    TEST_ASSERT_FALSE(timer.update(start, false, false, false));
-    TEST_ASSERT_FALSE(timer.update(start + 299999U, false, false, false));
-    TEST_ASSERT_TRUE(timer.update(start + 300000U, false, false, false));
+    timer.setClientCount(start - 1, 1);
+    timer.setClientCount(start, 0);
+    TEST_ASSERT_FALSE(timer.shouldShutdown(start + 299999U));
+    TEST_ASSERT_TRUE(timer.shouldShutdown(start + 300000U));
 }
 
 class CapturingTrace final : public IProbeTrace {

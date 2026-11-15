@@ -58,11 +58,14 @@ void fillStableGuid(uint8_t guid[16]) {
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
 #ifndef ALPHA_BUDDY_AP_SPIKE
     if (event == ARDUINO_EVENT_WIFI_AP_START ||
-        event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
-        presenter.setWaitingForWifi(true);
-    } else if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED ||
-               event == ARDUINO_EVENT_WIFI_AP_STOP) {
-        presenter.setWaitingForWifi(false);
+        event == ARDUINO_EVENT_WIFI_AP_STACONNECTED ||
+        event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED ||
+        event == ARDUINO_EVENT_WIFI_AP_STOP) {
+        uint8_t clients = event == ARDUINO_EVENT_WIFI_AP_STOP
+                              ? 0 : WiFi.softAPgetStationNum();
+        // Preserve a brief association even if it ended before callback delivery.
+        if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED && clients == 0) clients = 1;
+        presenter.setWifiClientCount(clients);
     }
 #endif
     if (event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) {
