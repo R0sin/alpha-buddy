@@ -11,7 +11,7 @@ enum class CaptureFeedback : uint8_t {
     Live,
     Autofocus,
     Capturing,
-    Success,
+    ControlComplete, // Control commands acknowledged; not proof of a saved photo.
     Failure,
 };
 

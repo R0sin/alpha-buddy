@@ -34,7 +34,7 @@ struct StreamReport {
     uint32_t presentMs = 0;
     uint32_t maximumDisplayMs = 0;
     uint32_t shutterAttempts = 0;
-    uint32_t shutterSuccesses = 0;
+    uint32_t shutterControlsCompleted = 0; // Acknowledged controls, not confirmed photos.
     uint32_t shutterFailures = 0;
     uint16_t lastShutterResponse = 0;
     size_t lastJpegBytes = 0;
@@ -42,7 +42,8 @@ struct StreamReport {
 
 class SonyLiveViewStream {
 public:
-    SonyLiveViewStream(IPtpIpCommandPort& port, IProbeTrace& trace);
+    using Clock = uint32_t (*)();
+    SonyLiveViewStream(IPtpIpCommandPort& port, IProbeTrace& trace, Clock clock = nullptr);
 
     StreamReport run(const PtpSessionConfig& session,
                      JpegFrameSink& frame,
@@ -53,6 +54,7 @@ public:
 private:
     IPtpIpCommandPort& _port;
     IProbeTrace& _trace;
+    Clock _clock;
 };
 
 }  // namespace alpha_buddy

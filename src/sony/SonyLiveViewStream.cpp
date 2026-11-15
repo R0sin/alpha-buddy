@@ -9,6 +9,7 @@
 #endif
 
 #include "alpha_buddy/SonyLiveViewProbe.h"
+#include "alpha_buddy/SonyCaptureTiming.h"
 
 #ifdef ALPHA_BUDDY_PROPERTY_PROBE
 #include "PropertySnapshotProbe.h"
@@ -34,7 +35,6 @@ constexpr uint8_t kObjectReadyAttempts = 20;
 constexpr uint32_t kObjectReadyDelayMs = 50;
 constexpr uint8_t kFrameAccessAttempts = 50;
 constexpr uint32_t kFrameAccessDelayMs = 20;
-constexpr uint32_t kShutterPressMs = 100;
 constexpr uint32_t kCaptureFeedbackMs = 700;
 
 struct HandshakeStep {
@@ -89,12 +89,6 @@ OperationResult setSonyControl(IPtpIpCommandPort& port,
                                 sizeof(payload));
 }
 
-void shutterDelay() {
-#ifndef ALPHA_BUDDY_NATIVE
-    delay(kShutterPressMs);
-#endif
-}
-
 void record(IProbeTrace& trace,
             ProbeStage stage,
             ProbeStatus status,
@@ -116,14 +110,15 @@ void record(IProbeTrace& trace,
 
 }  // namespace
 
-SonyLiveViewStream::SonyLiveViewStream(IPtpIpCommandPort& port, IProbeTrace& trace)
-    : _port(port), _trace(trace) {}
+SonyLiveViewStream::SonyLiveViewStream(IPtpIpCommandPort& port, IProbeTrace& trace, Clock clock)
+    : _port(port), _trace(trace), _clock(clock ? clock : nowMs) {}
 
 StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
                                      JpegFrameSink& frame,
                                      IFramePresenter& presenter,
                                      const StreamOptions& options,
                                      IShutterInput* shutterInput) {
+    const auto nowMs = _clock;
     StreamReport report;
     const uint32_t startedAt = nowMs();
     presenter.setCameraModes({});
@@ -214,7 +209,14 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
     bool shutterGestureActive = false;
     bool autofocusStarted = false;
     bool controlSessionHealthy = true;
-    uint32_t feedbackExpiresAtMs = 0;
+    uint32_t feedbackStartedAtMs = 0;
+    bool feedbackPending = false;
+    bool preparationFailed = false;
+    bool captureMayBeDown = false;
+    SonyCaptureTiming capture;
+    uint32_t captureStartedAt = 0;
+    uint32_t gestureStartedAt = 0;
+    uint32_t lastCapturePoll = 0;
 
     auto recordControl = [&](ProbeStage stage,
                              uint8_t substep,
@@ -228,58 +230,105 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
                2);
     };
 
-    auto processShutterInput = [&]() {
-        if (shutterInput == nullptr) {
-            return;
+    auto rememberControlFailure = [&](ProbeStage stage, const OperationResult& result) {
+        report.failedStage = stage;
+        report.transportError = result.transportError;
+        report.operationCode = kOperationSetControlDeviceB;
+        report.responseCode = result.responseCode;
+    };
+
+    // A failed send may still have reached the camera. Always attempt both
+    // releases, and retire the session if either release is not acknowledged.
+    auto releaseControls = [&]() {
+        bool ok = true;
+        if (captureMayBeDown) {
+            const auto result = setSonyControl(_port, kPropertyCapture, false);
+            recordControl(ProbeStage::Capture, 2, result);
+            captureMayBeDown = false;
+            if (!controlAccepted(result)) {
+                rememberControlFailure(ProbeStage::Capture, result);
+                ok = false;
+            }
         }
+        if (autofocusStarted) {
+            const auto result = setSonyControl(_port, kPropertyAutoFocus, false);
+            recordControl(ProbeStage::Autofocus, 2, result);
+            autofocusStarted = false;
+            if (!controlAccepted(result)) {
+                rememberControlFailure(ProbeStage::Autofocus, result);
+                ok = false;
+            }
+        }
+        if (!ok) controlSessionHealthy = false;
+        return ok;
+    };
+
+    auto finishCapture = [&](bool failed) {
+        const uint32_t releaseStartedAt = nowMs();
+        const bool released = releaseControls();
+        // Consume clicks accumulated during blocking property/release I/O.
+        // They belong to the busy interval, not to the next capture.
+        if (shutterInput) shutterInput->poll();
+        capture.reset();
+        presenter.setPreviewPaused(false);
+        if (failed || !released) {
+            ++report.shutterFailures;
+            presenter.setCaptureFeedback(CaptureFeedback::Failure);
+        } else {
+            // Green acknowledges the completed control sequence, not a photo.
+            ++report.shutterControlsCompleted;
+            presenter.setCaptureFeedback(CaptureFeedback::ControlComplete);
+        }
+        feedbackStartedAtMs = nowMs();
+        feedbackPending = true;
+#ifndef ALPHA_BUDDY_NATIVE
+        Serial.printf("{\"event\":\"shutter_result\",\"attempt\":%lu,"
+                      "\"elapsed_ms\":%lu,\"press_to_release_ms\":%lu,\"result\":\"%s\"}\n",
+                      static_cast<unsigned long>(report.shutterAttempts),
+                      static_cast<unsigned long>(nowMs() - captureStartedAt),
+                      static_cast<unsigned long>(releaseStartedAt - captureStartedAt),
+                      failed || !released ? "control_failed" : "control_completed");
+#else
+        (void)releaseStartedAt;
+#endif
+    };
+
+    auto processShutterInput = [&]() {
+        if (shutterInput == nullptr) return;
         const ShutterInputEvents events = shutterInput->poll();
-        if (events.pressed) {
+        // Do not queue another shot or reinterpret a new release as this shot.
+        if (capture.active()) return;
+        if (events.pressed && !shutterGestureActive) {
+            gestureStartedAt = nowMs();
             shutterGestureActive = true;
-            feedbackExpiresAtMs = 0;
+            preparationFailed = false;
+            feedbackPending = false;
             presenter.setCaptureFeedback(CaptureFeedback::Autofocus);
             autofocusStarted = currentFocus != FocusMode::MF || nowMs() - lastModePoll > 3500;
             if (autofocusStarted) {
                 presenter.setPreviewPaused(true);
-                const OperationResult autofocusOn = setSonyControl(_port,
-                                                                   kPropertyAutoFocus,
-                                                                   true);
-                recordControl(ProbeStage::Autofocus, 1, autofocusOn);
+                const auto result = setSonyControl(_port, kPropertyAutoFocus, true);
+                recordControl(ProbeStage::Autofocus, 1, result);
                 presenter.setPreviewPaused(false);
-                if (!controlAccepted(autofocusOn)) {
+                if (!controlAccepted(result)) {
+                    preparationFailed = true;
+                    rememberControlFailure(ProbeStage::Autofocus, result);
                     presenter.setCaptureFeedback(CaptureFeedback::Failure);
-                    if (!autofocusOn.transportOk) {
-                        report.failedStage = ProbeStage::Autofocus;
-                        report.transportError = autofocusOn.transportError;
-                        report.operationCode = kOperationSetControlDeviceB;
-                        report.responseCode = autofocusOn.responseCode;
-                        controlSessionHealthy = false;
-                    }
+                    if (!result.transportOk) controlSessionHealthy = false;
                 }
             }
         }
-
         if (!controlSessionHealthy) return;
         if (events.released && shutterGestureActive) {
-            if (events.cancelled) {
-                bool released = true;
-                if (autofocusStarted) {
-                    presenter.setPreviewPaused(true);
-                    const OperationResult result = setSonyControl(_port, kPropertyAutoFocus, false);
-                    recordControl(ProbeStage::Autofocus, 2, result);
-                    presenter.setPreviewPaused(false);
-                    released = controlAccepted(result);
-                    if (!released) {
-                        report.failedStage = ProbeStage::Autofocus;
-                        report.transportError = result.transportError;
-                        report.operationCode = kOperationSetControlDeviceB;
-                        report.responseCode = result.responseCode;
-                        controlSessionHealthy = false;
-                    }
-                }
-                shutterGestureActive = false;
-                autofocusStarted = false;
-                feedbackExpiresAtMs = 0;
-                presenter.setCaptureFeedback(released ? CaptureFeedback::Live : CaptureFeedback::Failure);
+            shutterGestureActive = false;
+            if (events.cancelled || preparationFailed) {
+                presenter.setPreviewPaused(true);
+                const bool released = releaseControls();
+                presenter.setPreviewPaused(false);
+                presenter.setCaptureFeedback(released && !preparationFailed
+                    ? CaptureFeedback::Live : CaptureFeedback::Failure);
+                feedbackPending = preparationFailed || !released;
+                feedbackStartedAtMs = nowMs();
 #ifndef ALPHA_BUDDY_NATIVE
                 Serial.printf("{\"event\":\"shutter_cancelled\",\"af_released\":%s}\n",
                               released ? "true" : "false");
@@ -289,62 +338,77 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
             presenter.setPreviewPaused(true);
             presenter.setCaptureFeedback(CaptureFeedback::Capturing);
             ++report.shutterAttempts;
-
-            const OperationResult captureOn = setSonyControl(_port,
-                                                             kPropertyCapture,
-                                                             true);
-            recordControl(ProbeStage::Capture, 1, captureOn);
-            report.lastShutterResponse = captureOn.responseCode;
-            shutterDelay();
-
-            const OperationResult captureOff = setSonyControl(_port,
-                                                              kPropertyCapture,
-                                                              false);
-            recordControl(ProbeStage::Capture, 2, captureOff);
-            OperationResult autofocusOff;
-            autofocusOff.transportOk = true;
-            autofocusOff.responseCode = kResponseOk;
-            if (autofocusStarted) {
-                autofocusOff = setSonyControl(_port, kPropertyAutoFocus, false);
-                recordControl(ProbeStage::Autofocus, 2, autofocusOff);
+            captureStartedAt = nowMs();
+            captureMayBeDown = true;
+            const auto result = setSonyControl(_port, kPropertyCapture, true);
+            recordControl(ProbeStage::Capture, 1, result);
+            report.lastShutterResponse = result.responseCode;
+            // Count the hold from acknowledgement. Never use pre-submit D213.
+            capture.start(nowMs(), !autofocusStarted);
+            lastCapturePoll = nowMs();
+#ifndef ALPHA_BUDDY_NATIVE
+            Serial.printf("{\"event\":\"shutter_submitted\",\"attempt\":%lu,"
+                          "\"focus\":%u,\"af\":%s,\"prepare_ms\":%lu,\"accepted\":%s}\n",
+                          static_cast<unsigned long>(report.shutterAttempts),
+                          unsigned(currentFocus), autofocusStarted ? "true" : "false",
+                          static_cast<unsigned long>(captureStartedAt - gestureStartedAt),
+                          controlAccepted(result) ? "true" : "false");
+#endif
+            if (!controlAccepted(result)) {
+                rememberControlFailure(ProbeStage::Capture, result);
+                if (!result.transportOk) controlSessionHealthy = false;
+                finishCapture(true);
             }
-            autofocusStarted = false;
-
-            presenter.setPreviewPaused(false);
-            const bool captureSucceeded = controlAccepted(captureOn) &&
-                                          controlAccepted(captureOff) &&
-                                          controlAccepted(autofocusOff);
-            if (captureSucceeded) {
-                ++report.shutterSuccesses;
-                presenter.setCaptureFeedback(CaptureFeedback::Success);
-            } else {
-                ++report.shutterFailures;
-                presenter.setCaptureFeedback(CaptureFeedback::Failure);
-            }
-            if (!controlAccepted(captureOff) || !controlAccepted(autofocusOff)) {
-                const OperationResult& cleanupFailure = !controlAccepted(captureOff)
-                    ? captureOff
-                    : autofocusOff;
-                report.failedStage = ProbeStage::Capture;
-                report.transportError = cleanupFailure.transportError;
-                report.operationCode = kOperationSetControlDeviceB;
-                report.responseCode = cleanupFailure.responseCode;
-                controlSessionHealthy = false;
-            }
-            feedbackExpiresAtMs = nowMs() + kCaptureFeedbackMs;
-            shutterGestureActive = false;
         }
-
-        if (!shutterGestureActive && feedbackExpiresAtMs != 0 &&
-            static_cast<int32_t>(nowMs() - feedbackExpiresAtMs) >= 0) {
-            feedbackExpiresAtMs = 0;
+        if (!shutterGestureActive && !capture.active() && feedbackPending &&
+            nowMs() - feedbackStartedAtMs >= kCaptureFeedbackMs) {
+            feedbackPending = false;
             presenter.setCaptureFeedback(CaptureFeedback::Live);
+        }
+    };
+
+    auto advanceCapture = [&]() {
+        if (!capture.active()) return;
+        if (capture.readyToRelease(nowMs())) {
+            finishCapture(false);
+            return;
+        }
+        if (capture.focusing() && nowMs() - lastCapturePoll >= 100) {
+            modeSink.reset();
+            const auto result = _port.execute(0x9209, nullptr, 0, &modeSink);
+            lastCapturePoll = nowMs();
+            CameraModes modes;
+            const bool valid = controlAccepted(result) && modeSink.decode(modes);
+            // Apply the deadline before interpreting a late response.
+            const bool expired = capture.readyToRelease(nowMs());
+            if (valid && !expired) capture.observe(nowMs(), modes);
+#ifndef ALPHA_BUDDY_NATIVE
+            Serial.printf("{\"event\":\"shutter_state\",\"attempt\":%lu,"
+                          "\"elapsed_ms\":%lu,\"valid\":%s,\"focus\":%u,"
+                          "\"d213\":%lu,\"d215\":%lu,\"drive\":%lu}\n",
+                          static_cast<unsigned long>(report.shutterAttempts),
+                          static_cast<unsigned long>(nowMs() - captureStartedAt),
+                          valid ? "true" : "false", unsigned(modes.focus),
+                          static_cast<unsigned long>(modes.focusFound),
+                          static_cast<unsigned long>(modes.objectInMemory),
+                          static_cast<unsigned long>(modes.driveMode));
+#endif
+            if (!result.transportOk) {
+                report.failedStage = ProbeStage::Capture;
+                report.transportError = result.transportError;
+                report.operationCode = 0x9209;
+                report.responseCode = result.responseCode;
+                controlSessionHealthy = false;
+                finishCapture(true);
+            } else if (expired) {
+                finishCapture(false);
+            }
         }
     };
 
     while (options.durationMs == 0 || nowMs() - streamStartedAt < options.durationMs) {
 #ifdef ALPHA_BUDDY_PROPERTY_PROBE
-        if (Serial.available() && Serial.read() == 'p') {
+        if (!capture.active() && Serial.available() && Serial.read() == 'p') {
             presenter.setPreviewPaused(true);
             const OperationResult snapshot = capturePropertySnapshot(_port);
             presenter.setPreviewPaused(false);
@@ -357,7 +421,8 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
             }
         }
 #endif
-        if (options.readCameraModes && !shutterGestureActive && nowMs() - lastModePoll >= 1000) {
+        if ((options.readCameraModes || shutterInput != nullptr) && !shutterGestureActive &&
+            !capture.active() && nowMs() - lastModePoll >= 1000) {
             modeSink.reset();
             const OperationResult result = _port.execute(0x9209, nullptr, 0, &modeSink);
             CameraModes modes;
@@ -386,6 +451,16 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
         processShutterInput();
         if (!controlSessionHealthy) {
             break;
+        }
+        advanceCapture();
+        if (!controlSessionHealthy) break;
+        if (capture.active()) {
+            // The display/input tasks remain live. Avoid live-view retry loops
+            // delaying a release while the camera is focusing or exposing.
+#ifndef ALPHA_BUDDY_NATIVE
+            delay(1);
+#endif
+            continue;
         }
         frame.reset();
         const uint32_t frameStartedAt = nowMs();
@@ -515,16 +590,18 @@ StreamReport SonyLiveViewStream::run(const PtpSessionConfig& session,
         }
     }
 
-    if (shutterGestureActive && autofocusStarted) {
-        const OperationResult autofocusOff = setSonyControl(_port,
-                                                            kPropertyAutoFocus,
-                                                            false);
-        recordControl(ProbeStage::Autofocus, 2, autofocusOff);
-        presenter.setCaptureFeedback(CaptureFeedback::Live);
+    if (capture.active()) {
+        controlSessionHealthy = false;
+        report.failedStage = ProbeStage::Capture;
+        finishCapture(true);
+    } else if (autofocusStarted) {
+        const bool released = releaseControls();
+        presenter.setCaptureFeedback(released && controlSessionHealthy
+            ? CaptureFeedback::Live : CaptureFeedback::Failure);
     }
 
     report.elapsedMs = nowMs() - startedAt;
-    report.success = options.durationMs != 0 &&
+    report.success = controlSessionHealthy && options.durationMs != 0 &&
                      report.framesPresented > 0 &&
                      nowMs() - streamStartedAt >= options.durationMs;
     if (report.success) {

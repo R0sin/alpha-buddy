@@ -744,14 +744,15 @@ private:
             case CaptureFeedback::Live: color = TFT_BLACK; break;
             case CaptureFeedback::Autofocus: color = TFT_YELLOW; break;
             case CaptureFeedback::Capturing: color = TFT_ORANGE; break;
-            case CaptureFeedback::Success: color = TFT_GREEN; break;
+            case CaptureFeedback::ControlComplete: color = TFT_GREEN; break;
             case CaptureFeedback::Failure: color = TFT_RED; break;
         }
         return color;
     }
 
     uint16_t frameBorderColor() const {
-        if (_connection.load() == CameraConnection::Connected && _shutterInput.cancelCounting())
+        if (_connection.load() == CameraConnection::Connected &&
+            _feedback.load() == CaptureFeedback::Autofocus && _shutterInput.cancelCounting())
             return (millis() / 200) % 2 == 0 ? TFT_YELLOW : TFT_BLACK;
         return feedbackColor(_feedback.load());
     }

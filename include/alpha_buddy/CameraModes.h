@@ -17,6 +17,10 @@ struct CameraModes {
     ExposureMode exposure = ExposureMode::Unknown;
     FocusMode focus = FocusMode::Unknown;
     SilentMode silent = SilentMode::Unknown;
+    // Raw diagnostics, not evidence that a photo was exposed or saved.
+    uint32_t focusFound = UINT32_MAX;
+    uint32_t objectInMemory = UINT32_MAX;
+    uint32_t driveMode = UINT32_MAX;
     uint32_t packed() const {
         return uint32_t(exposure) | (uint32_t(focus) << 8) | (uint32_t(silent) << 16);
     }
@@ -111,13 +115,18 @@ inline bool decodeCameraModes(const uint8_t* data, size_t size, CameraModes& out
         reader.integer(2); // get/set and enabled flags
         reader.value(type);
         const uint32_t current = reader.value(type);
-        const uint8_t bit = code == 0x500E ? 1 : (code == 0x500A ? 2 : (code == 0xD0DB ? 4 : 0));
+        const uint8_t bit = code == 0x500E ? 1 : code == 0x500A ? 2 :
+            code == 0xD0DB ? 4 : code == 0xD213 ? 8 : code == 0xD215 ? 16 :
+            code == 0x5013 ? 32 : 0;
         if (!code || (seen & bit)) return false;
         seen |= bit;
         if (type == 2 || type == 4 || type == 6) {
             if (bit == 1) modes.exposure = exposureMode(current);
             if (bit == 2) modes.focus = focusMode(current);
             if (bit == 4 && type == 2) modes.silent = silentMode(current);
+            if (bit == 8) modes.focusFound = current;
+            if (bit == 16) modes.objectInMemory = current;
+            if (bit == 32) modes.driveMode = current;
         }
         const uint32_t form = reader.integer(1);
         if (form == 1) {

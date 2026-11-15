@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include "alpha_buddy/SonyLiveViewProbe.h"
 #include "alpha_buddy/SonyLiveViewStream.h"
 #include "alpha_buddy/ModeIcon.h"
+#include "alpha_buddy/SonyCaptureTiming.h"
 
 using namespace alpha_buddy;
 
@@ -23,6 +25,9 @@ extern "C" void setUp() {}
 extern "C" void tearDown() {}
 
 namespace {
+
+uint32_t fakeTime = 0;
+uint32_t fakeClock() { return fakeTime; }
 
 void test_grid_reaches_image_edges_in_both_orientations() {
     // 640x424 JPEG decoded at quarter size, displayed in a 204x135 viewport.
@@ -174,6 +179,7 @@ public:
                             const uint32_t*,
                             size_t,
                             IDataSink* sink) override {
+        if (beforeExecute) beforeExecute(operationCode);
         operations.push_back(operationCode);
         OperationResult result;
         result.transportOk = true;
@@ -234,10 +240,20 @@ public:
         operations.push_back(operationCode);
         writtenParameters.assign(parameters, parameters + parameterCount);
         writtenData.assign(data, data + dataBytes);
-        if (parameterCount == 1 && dataBytes == 2) controls.push_back({parameters[0], data[0]});
+        if (parameterCount == 1 && dataBytes == 2) {
+            controls.push_back({parameters[0], data[0]});
+            controlTimes.push_back(fakeTime);
+            if (parameters[0] == 0xD2C2) {
+                captureHeld = data[0] == 2;
+                if (captureHeld) captureAt = fakeTime;
+            }
+        }
         OperationResult result;
         result.transportOk = writeTransportOk;
         result.responseCode = writeResponse;
+        if (parameterCount == 1 && dataBytes == 2 &&
+            parameters[0] == rejectedProperty && data[0] == rejectedValue)
+            result.responseCode = 0x200F;
         if (rejectAfRelease && parameterCount == 1 && parameters[0] == 0xD2C1 &&
             dataBytes == 2 && data[0] == 1) result.responseCode = 0x200F;
         result.transportError = writeTransportOk ? TransportError::None : TransportError::SocketClosed;
@@ -247,6 +263,12 @@ public:
 
     void close() override { ++closeCalls; }
 
+    std::function<void(uint16_t)> beforeExecute;
+    std::vector<uint32_t> controlTimes;
+    bool captureHeld = false;
+    uint32_t captureAt = 0;
+    uint32_t rejectedProperty = 0;
+    uint8_t rejectedValue = 0;
     int failOpenCount = 0;
     bool modeTransportOk = true;
     uint16_t modeResponse = 0x2001;
@@ -275,7 +297,9 @@ public:
     void setConnection(CameraConnection connection) override { connections.push_back(connection); }
     void setPreviewPaused(bool paused) override { pauses.push_back(paused); }
     void setCameraModes(CameraModes modes) override { modeUpdates.push_back(modes.packed()); }
+    void setCaptureFeedback(CaptureFeedback value) override { feedback.push_back(value); }
 
+    std::vector<CaptureFeedback> feedback;
     std::vector<CameraConnection> connections;
     std::vector<bool> pauses;
     std::vector<uint32_t> modeUpdates;
@@ -300,6 +324,188 @@ std::vector<uint8_t> modeReply(uint16_t focus = 0x8004) {
         put(2, 1); put(0, 2); put(0, 2);
     }
     return data;
+}
+
+std::vector<uint8_t> captureReply(uint16_t focus, uint32_t found,
+                                  uint32_t drive = 1, uint32_t memory = 0) {
+    auto data = modeReply(focus);
+    data[0] = 6;
+    const auto put = [&](uint32_t value, unsigned width) {
+        for (unsigned i = 0; i < width; ++i) data.push_back(uint8_t(value >> (8 * i)));
+    };
+    const uint32_t props[][2] = {{0xD213, found}, {0xD215, memory}, {0x5013, drive}};
+    for (const auto& prop : props) {
+        put(prop[0], 2); put(6, 2); put(0x0200, 2);
+        put(0, 4); put(prop[1], 4); put(0, 1);
+    }
+    return data;
+}
+
+class TimedShutter final : public IShutterInput {
+public:
+    ShutterInputEvents poll() override {
+        fakeTime += 10;
+        ++calls;
+        // A second click during capture must not queue an accidental repeat.
+        return {calls == 1 || (repeatWhileBusy && calls == 3),
+                calls == 1 || (repeatWhileBusy && calls == 3)};
+    }
+    bool repeatWhileBusy = false;
+    int calls = 0;
+};
+
+void test_capture_timing_fresh_focus_deadlines_and_wrap() {
+    SonyCaptureTiming capture;
+    const uint32_t start = UINT32_MAX - 100;
+    capture.start(start, false);
+    TEST_ASSERT_FALSE(capture.readyToRelease(start + 1999));
+    TEST_ASSERT_FALSE(capture.readyToRelease(start + 2000));
+    TEST_ASSERT_FALSE(capture.readyToRelease(start + 2199));
+    TEST_ASSERT_TRUE(capture.readyToRelease(start + 2200));
+    capture.reset();
+    TEST_ASSERT_FALSE(capture.active());
+    capture.start(100, true);
+    TEST_ASSERT_FALSE(capture.readyToRelease(299));
+    TEST_ASSERT_TRUE(capture.readyToRelease(300));
+    capture.start(100, false);
+    CameraModes modes; modes.focus = FocusMode::C; modes.focusFound = 2;
+    capture.observe(150, modes);
+    TEST_ASSERT_TRUE(capture.focusing()); // AF-S value is not AF-C confirmation.
+    modes.focus = FocusMode::S;
+    capture.observe(200, modes);
+    TEST_ASSERT_FALSE(capture.readyToRelease(399));
+    TEST_ASSERT_TRUE(capture.readyToRelease(400));
+    capture.start(500, false); // Previous shot's focus must not survive start.
+    TEST_ASSERT_TRUE(capture.focusing());
+    modes.focus = FocusMode::C; modes.focusFound = 6;
+    capture.observe(700, modes);
+    TEST_ASSERT_FALSE(capture.readyToRelease(899));
+    TEST_ASSERT_TRUE(capture.readyToRelease(900));
+}
+
+void test_capture_property_decoder_rejects_stale_partial_and_duplicate_data() {
+    auto data = captureReply(0x8004, 6, 0x8001, 0x8001);
+    CameraModes modes;
+    TEST_ASSERT_TRUE(decodeCameraModes(data.data(), data.size(), modes));
+    TEST_ASSERT_EQUAL_UINT32(6, modes.focusFound);
+    TEST_ASSERT_EQUAL_UINT32(0x8001, modes.objectInMemory);
+    TEST_ASSERT_EQUAL_UINT32(0x8001, modes.driveMode);
+    TEST_ASSERT_FALSE(decodeCameraModes(data.data(), data.size() - 1, modes));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, modes.focusFound);
+    data[data.size() - 15] = 0x13; // Duplicate D213 in place of drive mode.
+    data[data.size() - 14] = 0xD2;
+    TEST_ASSERT_FALSE(decodeCameraModes(data.data(), data.size(), modes));
+    auto absent = modeReply();
+    TEST_ASSERT_TRUE(decodeCameraModes(absent.data(), absent.size(), modes));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, modes.focusFound);
+}
+
+void test_short_press_waits_for_fresh_focus_and_reports_control_completion() {
+    // AF-C slow focus, AF-S, MF, missing status, unknown mode, continuous drive.
+    for (int scenario = 0; scenario < 6; ++scenario) {
+        fakeTime = UINT32_MAX - 500;
+        const uint16_t focus = scenario == 1 ? 2 : scenario == 2 ? 1 :
+                               scenario == 4 ? 999 : 0x8004;
+        FakePort port;
+        port.modeData = captureReply(focus, 6, scenario == 5 ? 0x8001 : 1, 0x8001);
+        unsigned pollsWhileHeld = 0;
+        port.beforeExecute = [&](uint16_t operation) {
+            if (operation != 0x9209 || !port.captureHeld) return;
+            ++pollsWhileHeld;
+            if (scenario == 3) { port.modeData = modeReply(focus); return; }
+            const bool focused = fakeTime - port.captureAt >= 600;
+            port.modeData = captureReply(focus, focused ? (scenario == 1 ? 2 : 6) : 1,
+                                         scenario == 5 ? 0x8001 : 1, 0x8001);
+        };
+        CapturingTrace trace;
+        FakePresenter presenter;
+        TimedShutter shutter; shutter.repeatWhileBusy = true;
+        JpegFrameSink frame(64);
+        StreamOptions options; options.durationMs = 3200;
+        SonyLiveViewStream stream(port, trace, fakeClock);
+        const auto report = stream.run({}, frame, presenter, options, &shutter);
+        TEST_ASSERT_TRUE(report.success);
+        TEST_ASSERT_EQUAL_UINT32(1, report.shutterAttempts);
+        TEST_ASSERT_EQUAL_UINT32(1, report.shutterControlsCompleted);
+        TEST_ASSERT_EQUAL_UINT32(0, report.shutterFailures);
+        const size_t pressIndex = scenario == 2 ? 0 : 1;
+        TEST_ASSERT_EQUAL_UINT32(scenario == 2 ? 2 : 4, port.controls.size());
+        TEST_ASSERT_EQUAL_UINT32(0xD2C2, port.controls[pressIndex][0]);
+        TEST_ASSERT_EQUAL_UINT32(2, port.controls[pressIndex][1]);
+        TEST_ASSERT_EQUAL_UINT32(1, port.controls[pressIndex + 1][1]);
+        const uint32_t held = port.controlTimes[pressIndex + 1] - port.controlTimes[pressIndex];
+        const uint32_t expected = scenario == 2 ? 200 : scenario == 3 ? 2200 : 800;
+        TEST_ASSERT_UINT32_WITHIN(20, expected, held);
+        if (scenario != 2) TEST_ASSERT_GREATER_THAN_UINT32(0, pollsWhileHeld);
+        bool completed = false;
+        for (auto feedback : presenter.feedback)
+            completed |= feedback == CaptureFeedback::ControlComplete;
+        TEST_ASSERT_TRUE(completed);
+        TEST_ASSERT_EQUAL(CaptureFeedback::Live, presenter.feedback.back());
+    }
+}
+
+void test_slow_property_response_cannot_restart_focus_deadline() {
+    fakeTime = 0;
+    FakePort port; port.modeData = captureReply(0x8004, 6);
+    port.beforeExecute = [&](uint16_t operation) {
+        if (operation == 0x9209 && port.captureHeld) fakeTime += 2500;
+    };
+    CapturingTrace trace;
+    FakePresenter presenter;
+    TimedShutter shutter;
+    JpegFrameSink frame(64);
+    StreamOptions options; options.durationMs = 3500;
+    SonyLiveViewStream stream(port, trace, fakeClock);
+    const auto report = stream.run({}, frame, presenter, options, &shutter);
+    TEST_ASSERT_EQUAL_UINT32(1, report.shutterControlsCompleted);
+    TEST_ASSERT_EQUAL_UINT32(4, port.controls.size());
+    TEST_ASSERT_EQUAL_UINT32(2600, port.controlTimes[2] - port.controlTimes[1]);
+}
+
+void test_capture_rejection_disconnect_and_cleanup_do_not_retrigger() {
+    // Lost status transport, refused capture, failed release, failed AF-on,
+    // refused property read, malformed property payload, interrupted session.
+    for (int scenario = 0; scenario < 7; ++scenario) {
+        fakeTime = 0;
+        FakePort port; port.modeData = captureReply(0x8004, 1);
+        if (scenario == 1 || scenario == 2) {
+            port.rejectedProperty = 0xD2C2;
+            port.rejectedValue = scenario == 1 ? 2 : 1;
+        }
+        if (scenario == 3) { port.rejectedProperty = 0xD2C1; port.rejectedValue = 2; }
+        port.beforeExecute = [&](uint16_t operation) {
+            if (operation != 0x9209 || !port.captureHeld) return;
+            if (scenario == 0) port.modeTransportOk = false;
+            if (scenario == 4) port.modeResponse = 0x2005;
+            if (scenario == 5) port.modeData = {0, 1};
+        };
+        CapturingTrace trace;
+        FakePresenter presenter;
+        TimedShutter shutter;
+        JpegFrameSink frame(64);
+        StreamOptions options; options.durationMs = scenario == 6 ? 150 : 3000;
+        SonyLiveViewStream stream(port, trace, fakeClock);
+        const auto report = stream.run({}, frame, presenter, options, &shutter);
+        TEST_ASSERT_EQUAL_UINT32(1, port.closeCalls);
+        TEST_ASSERT_EQUAL_UINT32(scenario == 3 ? 0 : 1, report.shutterAttempts);
+        TEST_ASSERT_EQUAL_UINT32(scenario == 3 ? 2 : 4, port.controls.size());
+        TEST_ASSERT_EQUAL_UINT32(0xD2C1, port.controls.back()[0]);
+        TEST_ASSERT_EQUAL_UINT32(1, port.controls.back()[1]);
+        if (scenario == 4 || scenario == 5) {
+            TEST_ASSERT_EQUAL_UINT32(1, report.shutterControlsCompleted);
+            TEST_ASSERT_EQUAL_UINT32(2200, port.controlTimes[2] - port.controlTimes[1]);
+        } else if (scenario != 3) {
+            TEST_ASSERT_EQUAL_UINT32(1, report.shutterFailures);
+            TEST_ASSERT_EQUAL_UINT32(0, report.shutterControlsCompleted);
+        }
+        if (scenario != 4 && scenario != 5) {
+            TEST_ASSERT_EQUAL_UINT32(0, report.shutterControlsCompleted);
+            for (auto feedback : presenter.feedback)
+                TEST_ASSERT_NOT_EQUAL(CaptureFeedback::ControlComplete, feedback);
+        }
+        if (scenario == 0 || scenario == 2 || scenario == 6) TEST_ASSERT_FALSE(report.success);
+    }
 }
 
 void test_camera_mode_wire_values_and_rejects_partial_snapshots() {
@@ -395,7 +601,7 @@ void test_stream_connection_lifecycle_and_capture_pause() {
     JpegFrameSink frame(64);
     SonyLiveViewStream stream(port, trace);
     const auto report = stream.run({}, frame, presenter, {}, &shutter);
-    TEST_ASSERT_EQUAL_UINT32(1, report.shutterSuccesses);
+    TEST_ASSERT_EQUAL_UINT32(1, report.shutterControlsCompleted);
     TEST_ASSERT_EQUAL_UINT32(3, presenter.connections.size());
     TEST_ASSERT_EQUAL(CameraConnection::Connecting, presenter.connections[0]);
     TEST_ASSERT_EQUAL(CameraConnection::Connected, presenter.connections[1]);
@@ -412,6 +618,23 @@ void test_stream_connection_lifecycle_and_capture_pause() {
     TEST_ASSERT_EQUAL_UINT32(2, presenter.connections.size());
     TEST_ASSERT_EQUAL(CameraConnection::Connecting, presenter.connections[0]);
     TEST_ASSERT_EQUAL(CameraConnection::Disconnected, presenter.connections[1]);
+}
+
+void test_quick_press_acknowledged_controls_show_green() {
+    class Shutter final : public IShutterInput {
+    public:
+        ShutterInputEvents poll() override { return {++calls == 1, calls == 1}; }
+        int calls = 0;
+    } shutter;
+    FakePort port;
+    CapturingTrace trace;
+    FakePresenter presenter; presenter.acceptFrames = 2;
+    JpegFrameSink frame(64);
+    SonyLiveViewStream stream(port, trace);
+    const auto report = stream.run({}, frame, presenter, {}, &shutter);
+    TEST_ASSERT_EQUAL_UINT32(1, report.shutterAttempts);
+    TEST_ASSERT_EQUAL_UINT32(1, report.shutterControlsCompleted);
+    TEST_ASSERT_EQUAL(CaptureFeedback::ControlComplete, presenter.feedback.back());
 }
 
 void test_stream_mf_and_cancel_never_send_unwanted_controls() {
@@ -441,7 +664,7 @@ void test_stream_mf_and_cancel_never_send_unwanted_controls() {
             SonyLiveViewStream stream(port, trace);
             const auto report = stream.run({}, frame, presenter, options, &shutter);
             TEST_ASSERT_EQUAL_UINT32(cancel ? 0 : 1, report.shutterAttempts);
-            TEST_ASSERT_EQUAL_UINT32(cancel ? 0 : 1, report.shutterSuccesses);
+            TEST_ASSERT_EQUAL_UINT32(cancel ? 0 : 1, report.shutterControlsCompleted);
             std::vector<std::array<uint32_t, 2>> expected;
             if (!mf) expected.push_back({0xD2C1, 2});
             if (!cancel) {
@@ -851,6 +1074,12 @@ void test_hud_uses_display_rotation_without_local_mirroring() {
 
 int main(int, char**) {
     UNITY_BEGIN();
+    RUN_TEST(test_slow_property_response_cannot_restart_focus_deadline);
+    RUN_TEST(test_capture_timing_fresh_focus_deadlines_and_wrap);
+    RUN_TEST(test_capture_property_decoder_rejects_stale_partial_and_duplicate_data);
+    RUN_TEST(test_short_press_waits_for_fresh_focus_and_reports_control_completion);
+    RUN_TEST(test_capture_rejection_disconnect_and_cleanup_do_not_retrigger);
+    RUN_TEST(test_quick_press_acknowledged_controls_show_green);
     RUN_TEST(test_grid_reaches_image_edges_in_both_orientations);
     RUN_TEST(test_side_button_double_click_timing_holds_and_wrap);
     RUN_TEST(test_flip_cancel_requires_continuity_and_latches_until_next_press);
