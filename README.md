@@ -5,7 +5,7 @@ StickS3 建立 Wi-Fi 热点，相机加入后自动连接，无需手机或路�
 
 ![alpha-buddy 在 StickS3 上显示 Sony 相机实时取景](assets/alpha-buddy-example.jpg)
 
-**当前为预览版，可从 [Releases](https://github.com/R0sin/alpha-buddy/releases/tag/v0.1.0-alpha.1) 下载固件。** 已验证设备为 StickS3 和 Sony α7C II（ILCE-7CM2，固件 2.01），其他型号和版本尚未验证。本次发布包已通过编译和离线检查，尚未完成该包的实机刷写与相机验收。
+**当前为预览版，可从 [Releases](https://github.com/R0sin/alpha-buddy/releases/tag/v0.1.0-alpha.2) 下载固件。** 已验证设备为 StickS3 和 Sony α7C II（ILCE-7CM2，固件 2.01），其他型号和版本尚未验证。本版应用固件已在 StickS3 上刷写并观察到取景运行，用户已实测可以拍摄；完整安装包已做离线校验，尚未重新刷写验收。
 
 ## 功能
 
@@ -19,12 +19,12 @@ StickS3 建立 Wi-Fi 热点，相机加入后自动连接，无需手机或路�
 
 ### 刷入固件包
 
-解压 `alpha-buddy-v0.1.0-alpha.1-sticks3.zip`，用 USB 数据线连接 StickS3，在解压目录打开终端：
+解压 `alpha-buddy-v0.1.0-alpha.2-sticks3.zip`，用 USB 数据线连接 StickS3，在解压目录打开终端：
 
 ```sh
 python -m pip install esptool==4.9.0
 python -m serial.tools.list_ports
-python -m esptool --chip esp32s3 --port COM9 --baud 460800 write_flash 0x0 alpha-buddy-v0.1.0-alpha.1-sticks3-full.bin
+python -m esptool --chip esp32s3 --port COM9 --baud 460800 write_flash 0x0 alpha-buddy-v0.1.0-alpha.2-sticks3-full.bin
 ```
 
 将 `COM9` 替换为实际端口。若无法连接，接上 USB 后长按侧面复位按钮，直到内部绿灯闪烁，再重试。
@@ -62,7 +62,7 @@ pio run -e m5stack-sticks3 --target upload --upload-port COM9
 | 操作 | 功能 |
 | --- | --- |
 | 按下 Button A | 准备拍摄；自动对焦模式下启动对焦 |
-| 松开 Button A | 拍摄 |
+| 松开 Button A | 提交拍摄，松手后继续处理对焦和快门释放 |
 | 按住 A，翻到相反横屏方向并保持超过 1 秒 | 出现黄色划线相机图标后，松开取消本次拍摄 |
 | 双击侧键 Button B | 开关九宫格，重启后保留设置 |
 | 翻转设备 | 自动调整画面方向 |
@@ -73,7 +73,8 @@ pio run -e m5stack-sticks3 --target upload --upload-port COM9
 
 - 热点连续五分钟无设备连接时自动关机。
 - 照片保存在相机中；取景画质不影响照片质量设置。
-- 绿色拍摄反馈表示命令被接受，请以相机实际保存结果为准。
+- 绿色短亮表示拍摄控制命令全部确认完成，红色表示控制失败；请以相机实际保存结果为准。
+- 短按会继续处理本次拍摄，无需用长按提供全部对焦时间。连拍和 B 门沿用机身模式，可能拍摄多张或改变曝光时长。
 - 预览版尚未完成全部拍摄和断线恢复场景验证。
 
 ## 许可证
